@@ -1,4 +1,4 @@
-package lv
+package lv.cf
 
 import io.minio.*
 import java.io.ByteArrayInputStream
@@ -57,7 +57,7 @@ fun makeBucket(bucketName : String, mc : MinioAsyncClient) : CompletableFuture<V
 
 fun putObject(bucketName: String, key : String, client: MinioAsyncClient): CompletableFuture<ObjectWriteResponse> {
     val binary = generateBlob()
-    println("$key has size ${binary.available()}")
+    println("${Thread.currentThread().name} $key has size ${binary.available()}")
     val putObjectArgs = PutObjectArgs.builder()
         .bucket(bucketName)
         .`object`(key)
@@ -65,7 +65,7 @@ fun putObject(bucketName: String, key : String, client: MinioAsyncClient): Compl
         .build()
     val cf = client.putObject(putObjectArgs)
     cf.handle { _, throwable ->
-        println(key)
+        println("${Thread.currentThread().name} - $key")
         binary.close()
     }
     return cf;
