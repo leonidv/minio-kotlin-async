@@ -5,6 +5,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.Channel.Factory.UNLIMITED
 import kotlinx.coroutines.future.await
+import kotlinx.coroutines.sync.Semaphore
 import okhttp3.OkHttpClient
 import java.io.ByteArrayInputStream
 import java.util.logging.Level
@@ -18,7 +19,9 @@ const val BUCKET_NAME = "async-test"
 
 const val DEBUG = true;
 
-const val OBJECTS_COUNT = 100_000
+const val OBJECTS_COUNT = 100_000;
+
+const val MAX_GET_OBJECT_COROUTINES = 10_000;
 
 val s3dispatcher = Dispatchers.IO.limitedParallelism(10, "s3-limited")
 val cpuIntensiveDispatcher = Dispatchers.IO.limitedParallelism(2, "cpu intensive")
@@ -52,6 +55,9 @@ fun main() {
         downloadedSize = runBlocking {
             var processed = 0;
             var sizeProcessed = 0L;
+
+            val semaphore = Semaphore(MAX_GET_OBJECT_COROUTINES)
+
             val channelWithObjectSizes = Channel<Pair<String, Long>>(UNLIMITED)
 
             val percentOfTasks: Int = max(OBJECTS_COUNT / 100, 1);
@@ -60,6 +66,7 @@ fun main() {
                 (1..OBJECTS_COUNT)
                     .map { it.toString() }
                     .map { key ->
+                        semaphore.acquire()
                         launch(s3dispatcher) {
                             val response = async(s3dispatcher) {
                                 loadBlob(key, client)
@@ -74,7 +81,7 @@ fun main() {
                                 channelWithObjectSizes.send(Pair(key, blobSize))
                                 blobSize
                             }
-                        }
+                        }.invokeOnCompletion { semaphore.release() }
                     }
             }.invokeOnCompletion { channelWithObjectSizes.close() }
 
@@ -82,7 +89,7 @@ fun main() {
                 for ((key, size) in channelWithObjectSizes) {
                     processed++
                     sizeProcessed += size
-                    debug(key, "in channel")
+                    debug(key, "processed")
                     if (processed % percentOfTasks == 0) {
                         println("${processed}/$OBJECTS_COUNT, downloaded = $sizeProcessed")
                     }
@@ -96,7 +103,7 @@ fun main() {
     val speed = if (getTime.inWholeSeconds == 0L) {
         "${OBJECTS_COUNT.toDouble()/getTime.inWholeMilliseconds.toDouble()}obj/ms"
     } else {
-        "${OBJECTS_COUNT/(getTime.inWholeMilliseconds/1000.0)}obj/s"
+        "${OBJECTS_COUNT/(getTime.inWholeMilliseconds/1000.0)} obj/s"
     }
     println("That's all! $OBJECTS_COUNT objects in ${getTime.inWholeMilliseconds} ($speed), total size: $downloadedSize")
     exitProcess(1)
