@@ -2,22 +2,29 @@ package lv.coroutines
 
 import io.minio.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.Channel.Factory.UNLIMITED
 import kotlinx.coroutines.future.await
+import okhttp3.OkHttpClient
 import java.io.ByteArrayInputStream
+import java.util.logging.Level
+import java.util.logging.Logger
 import kotlin.math.max
 import kotlin.random.Random
 import kotlin.system.exitProcess
-import kotlin.system.measureTimeMillis
+import kotlin.time.measureTime
 
 const val BUCKET_NAME = "async-test"
 
 const val DEBUG = true;
 
-const val OBJECTS_COUNT = 10_000
+const val OBJECTS_COUNT = 100_000
 
-val s3dispatcher = Dispatchers.IO.limitedParallelism(max(OBJECTS_COUNT,16),"s3-limited")
-val cpuIntensiveDispatcher = Dispatchers.IO.limitedParallelism(2,"cpu intensive")
+val s3dispatcher = Dispatchers.IO.limitedParallelism(10, "s3-limited")
+val cpuIntensiveDispatcher = Dispatchers.IO.limitedParallelism(2, "cpu intensive")
 fun main() {
+    Logger.getLogger(OkHttpClient::class.java.name).level = Level.FINE
+
     val client =
         MinioAsyncClient
             .builder()
@@ -27,42 +34,77 @@ fun main() {
             .build();
 
 
+//    val putTime = measureTimeMillis {
+//        runBlocking {
+//            makeBucket(BUCKET_NAME, client)
+//
+//            (1..OBJECTS_COUNT).forEach { key ->
+//                launch(s3dispatcher) { putObject(BUCKET_NAME, "$key", client) }
+//            }
+//        }
+//    }
+//
+//    println("put $OBJECTS_COUNT objects in ${putTime}ms")
+//    println("=".repeat(80))
 
-    val putTime = measureTimeMillis {
-        runBlocking {
-            makeBucket(BUCKET_NAME, client)
-
-            (1..OBJECTS_COUNT).forEach { key ->
-                launch(s3dispatcher) { putObject(BUCKET_NAME, "$key", client) }
-            }
-        }
-    }
-
-    println("put $OBJECTS_COUNT objects in ${putTime}ms")
-    println("=".repeat(80))
-
-    var downloadedSize = -1;
-    val getTime = measureTimeMillis {
+    var downloadedSize = -1L;
+    val getTime = measureTime {
         downloadedSize = runBlocking {
-            (1..OBJECTS_COUNT).map { key ->
-                val response = async(s3dispatcher) {
-                    loadBlob("$key",client)
-                }.await()
-                val obj = async (s3dispatcher) {
-                    response.readAllBytes()
-                }.await()
-                obj.size
-            }.reduce{ acc, sum -> acc + sum}
+            var processed = 0;
+            var sizeProcessed = 0L;
+            val channelWithObjectSizes = Channel<Pair<String, Long>>(UNLIMITED)
+
+            val percentOfTasks: Int = max(OBJECTS_COUNT / 100, 1);
+
+            launch() {
+                (1..OBJECTS_COUNT)
+                    .map { it.toString() }
+                    .map { key ->
+                        launch(s3dispatcher) {
+                            val response = async(s3dispatcher) {
+                                loadBlob(key, client)
+                            }.await();
+
+                            response.use {
+                                debug(key, "before readAllBytes()")
+                                val blob =  response.readAllBytes()
+                                debug(key, "after readAllBytes()")
+
+                                val blobSize = blob.size.toLong()
+                                channelWithObjectSizes.send(Pair(key, blobSize))
+                                blobSize
+                            }
+                        }
+                    }
+            }.invokeOnCompletion { channelWithObjectSizes.close() }
+
+            launch(Dispatchers.Default) {
+                for ((key, size) in channelWithObjectSizes) {
+                    processed++
+                    sizeProcessed += size
+                    debug(key, "in channel")
+                    if (processed % percentOfTasks == 0) {
+                        println("${processed}/$OBJECTS_COUNT, downloaded = $sizeProcessed")
+                    }
+                }
+            }.join();
+
+            sizeProcessed
         }
     }
 
-    println("get $OBJECTS_COUNT objects, total size: $downloadedSize in $getTime")
+    val speed = if (getTime.inWholeSeconds == 0L) {
+        "${OBJECTS_COUNT.toDouble()/getTime.inWholeMilliseconds.toDouble()}obj/ms"
+    } else {
+        "${OBJECTS_COUNT/(getTime.inWholeMilliseconds/1000.0)}obj/s"
+    }
+    println("That's all! $OBJECTS_COUNT objects in ${getTime.inWholeMilliseconds} ($speed), total size: $downloadedSize")
     exitProcess(1)
 }
 
-fun debug(taskId : String, msg: String = "") {
+fun debug(taskId: String, msg: String = "") {
     if (DEBUG) {
-        println("${Thread.currentThread().name} - $taskId $msg")
+        println("${Thread.currentThread().name} - req#$taskId $msg")
     }
 }
 
@@ -80,6 +122,7 @@ suspend fun makeBucket(bucketName: String, mc: MinioAsyncClient) {
 suspend fun putObject(bucketName: String, taskId: String, client: MinioAsyncClient) =
     coroutineScope {
         val blob = async(s3dispatcher) { generateBlob(taskId) }.await()
+
         blob.use { binary ->
             debug(taskId, "has size ${binary.available()}")
 
@@ -90,7 +133,7 @@ suspend fun putObject(bucketName: String, taskId: String, client: MinioAsyncClie
                 .build()
             client.putObject(putObjectArgs).await()
 
-            debug(taskId,"object put to S3")
+            debug(taskId, "object put to S3")
         }
     }
 
@@ -104,11 +147,10 @@ fun generateBlob(taskId: String): ByteArrayInputStream {
 };
 
 suspend fun loadBlob(taskId: String, client: MinioAsyncClient): GetObjectResponse {
-    //val downloadArgs = DownloadObjectArgs.builder().bucket(BUCKET_NAME).
     val getArgs = GetObjectArgs.builder().bucket(BUCKET_NAME).`object`(taskId).build();
     debug(taskId, "Before get object")
     val cf = client.getObject(getArgs);
     val objectResponse = cf.await();
     debug(taskId, "After get response")
-    return client.getObject(getArgs).await()
+    return objectResponse
 }
